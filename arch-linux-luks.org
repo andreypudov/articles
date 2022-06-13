@@ -1,0 +1,213 @@
+* Arch Linux Installation Guide
+Based on [[https://wiki.archlinux.org/title/Installation_guide#Connect_to_the_internet][Installation Guide]]
+
+** Pre-installation
+
+- Download Arch Linux ISO file: [[https://archlinux.org/download/][Arch Linux Downloads]]
+
+- Plug and identify your USB flash drive
+  #+begin_src shell
+  lsblk | grep -v "rom\|loop\|airoot"
+  #+end_src
+
+- Unmount if necessary
+  #+begin_src shell
+  umount /run/media/<user>/<uuid>
+  #+end_src
+
+- Create a bootable USB
+  #+begin_src shell
+  sudo dd if=archlinux-2022.06.01-x86_64.iso of=/dev/sdX status=progress bs=4M && sync
+  #+end_src
+
+** Installation
+
+*** Prepare
+
+- Load proper keyboard layout
+  #+begin_src shell
+  # list of all the available keymaps
+  # localectl list-keymaps
+  loadkeys us
+  #+end_src
+
+- Connect to network
+  #+begin_src shell
+  ip link
+  #+end_src
+
+- Test connection
+  #+begin_src shell
+  ping -c 3 andreypudov.com
+  #+end_src
+
+*** Partition disk
+
+LVM on LUKS / https://wiki.archlinux.org/title/dm-crypt/Encrypting_an_entire_system
+
++-----------------------+-----------------------+-----------------------------------------------------------+
+| EFI System Partition  |                       | LVM on LUKS /dev/nvme0n1p3 (/dev/sda3)                    |
+|                       |                       |-------------------+-------------------+-------------------|
+| /boot/efi             | /boot                 | swap              | / (root)          | /home             |
+| /dev/nvme0n1p1 (sda1) | /dev/nvme0n1p2 (sda2) | /dev/cryptvg/swap | /dev/cryptvg/root | /dev/cryptvg/home |
+| boot, esp             |                       |                   |                   |                   |
+|                       |                       |                                                           |
+| fat32                 | ext4                  | swap              | ext4              | ext4              |
+| 128 MB                | 512 MB                | 1 GB              | 32 GB             | ...               |
++-----------------------+-----------------------+-------------------+-------------------+-------------------+
+
+- Identify devices
+  #+begin_src shell
+  $ lsblk | grep -v "rom\|loop\|airoot"
+  #+end_src
+
+- Destroy existing data
+  #+begin_src
+  $ dd if=/dev/zero of=/dev/sda bs=8M
+  #+end_src
+
+- Create two partitions, one for EFI System and another one for LUKS
+  #+begin_src shell
+  $ parted /dev/sda
+  mklabel gpt
+  mkpart "EFI System Partition" fat32 1M 129M
+  mkpart "Boot Partition" ext4 129M 641M
+  mkpart "LUKS Partition" ext4 641M 100%
+  set 1 boot on
+  set 1 esp on
+  quit
+  #+end_src
+
+- Verify partitions
+  #+begin_src shell
+  $ lsblk /dev/sda
+  #+end_src
+
+- Format partitions
+  #+begin_src shell
+  $ mkfs -t vfat -F 32  /dev/sda1
+  $ mkfs -t ext4  /dev/sda1
+  #+end_src
+
+*** Setup encryption using LUKS
+
+- Creates LVM partitions
+  #+begin_src shell
+  $ cryptsetup -c aes-xts-plain64 -y --use-random luksFormat /dev/sda3
+  $ cryptsetup luksOpen /dev/sda3 luks
+
+  $ pvcreate /dev/mapper/luks
+  $ vgcreate mastervg /dev/mapper/luks
+  $ lvcreate --size 1G --name swap mastervg
+  $ lvcreate --size 32G --name root mastervg
+  $ lvcreate -l 100%FREE --name home mastervg
+  #+end_src
+
+- Create file systems on encrypted partitions
+  #+begin_src shell
+  $ mkswap /dev/mapper/mastervg-swap
+  $ mkfs -text4 /dev/mapper/mastervg-root
+  $ mkfs -text4 /dev/mapper/mastervg-home
+  #+end_src
+
+***  Mount partitions
+
+  #+begin_src shell
+  $ swapon /dev/mapper/mastervg-swap
+  $ mount /dev/mapper/mastervg-root /mnt
+  $ mkdir /mnt/home
+  $ mount /dev/mapper/mastervg-home /mnt/home
+  $ mkdir -p /mnt/boot/efi
+  $ mount /dev/sda2 /mnt/boot
+  $ mount /dev/sda1 /mnt/boot/efi
+  #+end_src
+
+*** Install base system
+
+  #+begin_src shell
+  $ pacstrap /mnt base base-devel linux linux-firmware lvm2 emacs zsh
+  #+end_src
+
+** Configure the system
+
+- Generate fstab file
+  #+begin_src shell
+  $ genfstab -U -p /mnt >> /mnt/etc/fstab
+  #+end_src
+
+- Change root into the new system:
+  #+begin_src shell
+  $ arch-chroot /mnt
+  #+end_src
+
+- Set locale
+  #+begin_src shell
+  $ emacs /etc/locale.gen
+  # Uncomment: en_US.UTF-8 UTF-8
+  $ locale-gen
+  $ echo LANG=en_US.UTF-8 > /etc/locale.conf
+  $ export LANG=en_US.UTF-8
+  #+end_src
+
+- Set timezone
+  #+begin_src shell
+  $ ln -s /usr/share/zoneinfo/<zone> /etc/localtime
+  $ hwclock --systohc --utc
+  #+end_src
+
+- Set hostname
+  #+begin_src shell
+  $ echo <hostname> > /etc/hostname
+  #+end_src
+
+- Set root password
+  #+begin_src shell
+  $ passwd
+  #+end_src
+
+- Setup Wi-Fi
+  #+begin_src shell
+  $ pacman -S iw wpa_supplicant dialog
+  #+end_src
+
+- Add non-root user
+  #+begin_src shell
+  $ useradd -m -G wheel -s /bin/zsh <username>
+  $ passwd <username>
+  $ EDITOR=emacs visudo
+  # Uncomment: %wheel      ALL=(ALL) ALL
+  #+end_src
+
+- Configure mkinitcpio
+  #+begin_src shell
+  $ emacs /etc/mkinitcpio.conf
+  # Add ext4 to MODULES
+  # Add encrypt and lvm2 to HOOKS
+  $ mkinitcpio -p linux
+  #+end_src
+
+- Install and configure a bootloader
+  #+begin_src shell
+  $ pacman -S grub efibootmgr
+  $ grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=grub_uefi --recheck
+  $ emacs /etc/default/grub
+  # GRUB_CMDLINE_LINUX="cryptdevice=/dev/sda3:cryptroot"
+  #+end_src
+
+- Generate main configuration file
+  #+begin_src shell
+  $ grub-mkconfig -o /boot/grub/grub.cfg
+  $ efibootmgr -c -g -d /dev/sda -p 1 -w -L "Arch Linux (GRUB)" -l /boot/efi//EFI/grub_uefi/grubx64.efi
+  #+end_src
+
+- Unmount all partitions
+  #+begin_src shell
+  $ exit
+  $ umount -R /mnt
+  $ swapoff -a
+  #+end_src
+
+- Reboot
+  #+begin_src shell
+  $ reboot
+  #+end_src
